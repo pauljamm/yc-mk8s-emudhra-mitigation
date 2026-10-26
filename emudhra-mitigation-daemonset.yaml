@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: emudhra-ca-mitigation
+  namespace: kube-system
+data:
+  mitigate.py: |
+    #!/usr/bin/env python3
+    """Run in the worker node's mount/PID/network namespaces, as root."""
+    import argparse
+    import fcntl
+    import hashlib
+    import os
+    from pathlib import Path
+    import re
+    import ssl
+    import subprocess
+    import tempfile
+    
+    BLOCKED = {
+        "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b": "emSign ECC Root CA - G3",
+        "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4": "AAA Certificate Services",
+    }
+    ENTRIES = {"mozilla/emSign_ECC_Root_CA_-_G3.crt", "mozilla/Comodo_AAA_Services_root.crt"}
+    CONFIG = Path("/etc/ca-certificates.conf")
+    BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
+    CERT_DIR = Path("/etc/ssl/certs")
+    STATE = Path("/var/lib/yc-emudhra-mitigation")
+    DEBIAN_VERSION = Path("/etc/debian_version")
+    PEM = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+    
+    
+    def log(message):
+        print(message, flush=True)
+    
+    
+    def atomic_write(path, data, mode=0o644):
+        fd, name = tempfile.mkstemp(prefix=".emudhra-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fchmod(stream.fileno(), mode)
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    
+    
+    def disabled_config(text):
+        lines = text.splitlines(keepends=True)
+        return "".join("!" + line if line.strip() in ENTRIES else line for line in lines)
+    
+    
+    def fingerprints(data):
+        return [hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+                for pem in PEM.findall(data)]
+    
+    
+    def verify():
+        if not BUNDLE.is_file() or not CERT_DIR.is_dir():
+            raise RuntimeError("System CA store missing")
+        # Parsing the bundle independently also rejects an empty/unusable store.
+        ssl.create_default_context(cafile=str(BUNDLE))
+        if not fingerprints(BUNDLE.read_text()):
+            raise RuntimeError("Empty CA bundle")
+        affected = []
+        for path in sorted(CERT_DIR.iterdir()):
+            if path.is_file():
+                for digest in fingerprints(path.read_text(errors="replace")):
+                    if digest in BLOCKED:
+                        affected.append("{}: {}".format(path, BLOCKED[digest]))
+        if affected:
+            raise RuntimeError("Distrusted roots remain (including possible custom copies): " + "; ".join(affected))
+        if disabled_config(CONFIG.read_text()) != CONFIG.read_text():
+            raise RuntimeError("Distrusted roots are still enabled in ca-certificates.conf")
+    
+    
+    def run(*args):
+        subprocess.run(args, check=True, timeout=180)
+    
+    
+    def reconcile():
+        if not DEBIAN_VERSION.exists():
+            raise RuntimeError("Only Debian/Ubuntu update-ca-certificates stores are supported")
+        original = CONFIG.read_bytes()
+        updated = disabled_config(original.decode()).encode()
+        backup = STATE / "ca-certificates.conf.before"
+        if not backup.exists():
+            atomic_write(backup, original, 0o600)
+        if updated != original:
+            atomic_write(CONFIG, updated, CONFIG.stat().st_mode & 0o777)
+            log("Disabled the two affected Mozilla CA entries")
+        try:
+            verify()
+        except (RuntimeError, ssl.SSLError):
+            # Also repairs interruption after writing the configuration but before
+            # regenerating the bundle. Never uses apt or changes unrelated packages.
+            run("update-ca-certificates", "--fresh")
+            verify()
+        digest = hashlib.sha256(BUNDLE.read_bytes()).hexdigest()
+        marker = STATE / "restarted-bundle.sha256"
+        if not marker.exists() or marker.read_text().strip() != digest:
+            # Go clients may cache system roots for their entire process lifetime.
+            # Write the marker only after containerd has restarted successfully.
+            run("systemctl", "restart", "containerd")
+            run("systemctl", "is-active", "--quiet", "containerd")
+            atomic_write(marker, (digest + "\n").encode(), 0o600)
+            log("Restarted containerd to reload the CA store")
+        verify()
+        log("PASS: affected roots absent from system bundle and certificate directory")
+    
+    
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("mode", choices=("apply", "check"))
+        args = parser.parse_args()
+        if args.mode == "check":
+            verify()
+            digest = hashlib.sha256(BUNDLE.read_bytes()).hexdigest()
+            if (STATE / "restarted-bundle.sha256").read_text().strip() != digest:
+                raise RuntimeError("Containerd has not yet reloaded this CA bundle")
+            return
+        STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (STATE / "lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            reconcile()
+    
+    
+    if __name__ == "__main__":
+        try:
+            main()
+        except Exception as error:
+            log("FAIL: {}".format(error))
+            raise SystemExit(1)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: emudhra-ca-mitigation
+  namespace: kube-system
+  labels:
+    app: emudhra-ca-mitigation
+spec:
+  selector:
+    matchLabels:
+      app: emudhra-ca-mitigation
+  minReadySeconds: 10
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: emudhra-ca-mitigation
+    spec:
+      hostPID: true
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 210
+      containers:
+        - name: mitigate
+          image: cr.yandex/mirror/ubuntu:22.04
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              trap 'exit 0' TERM INT
+              while true; do
+                nsenter --target 1 --mount --uts --ipc --net --pid --root --wd -- \
+                  python3 - apply < /opt/mitigation/mitigate.py
+                sleep 300 &
+                wait $!
+              done
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - >-
+                  nsenter --target 1 --mount --uts --ipc --net --pid --root --wd --
+                  python3 - check < /opt/mitigation/mitigate.py
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /opt/mitigation
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: emudhra-ca-mitigation
